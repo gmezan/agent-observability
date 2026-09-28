@@ -33,7 +33,6 @@ specialist is a URL in `docker-compose.yml`, not a code change.
 distributed_agents/
 ├── common/                  # "agentmesh": the shared plumbing, installed into every image
 │   └── src/agentmesh/
-│       ├── app.py           # run(build): config -> telemetry -> agent -> serve
 │       ├── settings.py      # env-driven deployment config (bind, public URL, peers)
 │       ├── observability.py # OTEL providers + the instrumentation that carries traceparent
 │       ├── server.py        # agent card, A2A routes, FastAPI app, uvicorn entrypoint
@@ -48,27 +47,24 @@ Each service's `main.py` contains only domain code: the agent's name, its
 instructions and its tools. Everything about *being a service* — how it binds,
 how it's discovered, how it's traced — lives in `common/`.
 
-A service is therefore just a `build` function and one call:
+A service is therefore a `main()` that wires four things together:
 
 ```python
-def build(_: ServiceSettings) -> AgentSpec:
+def main() -> None:
+    settings = ServiceSettings()
+    setup_observability(settings.service_name)
+
     tools = [check_invoice_status, issue_refund]
-    return AgentSpec(
-        agent=Agent(client=OpenAIChatClient(), name="billing_agent", ..., tools=tools),
-        tools=tools,
-        tags=["billing"],
-    )
+    agent = Agent(client=OpenAIChatClient(), name="billing_agent", ..., tools=tools)
 
-
-if __name__ == "__main__":
-    run(build)
+    serve(agent, settings, skills_from_tools(tools, tags=["billing"]))
 ```
 
-`run()` takes a *builder* rather than a ready-made agent on purpose. Telemetry
-has to be configured before the agent exists — the Agent Framework resolves a
-tracer at construction time, so an agent built first keeps a no-op tracer and
-its `invoke_agent` spans never reach the exporter. Passing a callable makes that
-ordering structural instead of a comment someone can violate.
+Startup order is a readability convention, not a correctness requirement:
+`configure_otel_providers()` may be called after the agent exists. The Agent
+Framework resolves its tracer lazily, per span, and `HTTPXClientInstrumentor`
+patches httpx at class level, so objects built beforehand are still traced
+(both verified — see below).
 
 ## Prerequisites
 
@@ -278,6 +274,33 @@ tracer provider before the app starts, which costs the Agent Framework's
 HTTP observability. Hence three explicit instrumentor calls in
 `observability.py`, which is the "install the instrumentor for whatever makes
 the network call" advice, just written down where it can be seen.
+
+### What the SDKs do and don't give you
+
+`common/` is deliberately thin, but it isn't zero, and it's worth being precise
+about why each piece can't just be an SDK call. Checked against the installed
+versions (`agent-framework` 1.19.0, `a2a-sdk` 1.1.5):
+
+| Concern | SDK facility used | What's left hand-written |
+| --- | --- | --- |
+| Providers, exporters, gen_ai spans | `configure_otel_providers()` (Agent Framework) | nothing — one call, env-driven |
+| A2A routes + JSON-RPC dispatch | `add_a2a_routes_to_fastapi`, `create_agent_card_routes`, `create_jsonrpc_routes` | nothing — this *is* the documented pattern |
+| Serving an agent over A2A | `A2AExecutor` (Agent Framework), `DefaultRequestHandler` (a2a-sdk) | nothing |
+| Peer discovery | `A2ACardResolver` + `A2AAgent.as_tool()` | a loop over `A2A_PEER_URLS` |
+| **traceparent across the hop** | `HTTPXClientInstrumentor`, `FastAPIInstrumentor` | 3 calls — no A2A/MAF equivalent exists |
+| **Building the AgentCard / skills** | — | `build_agent_card()`, `skills_from_tools()` |
+
+Two things are worth knowing before trying to delete more:
+
+* **`a2a-sdk` 1.1.5 has no application class.** There is no `a2a.server.apps`
+  package and no `A2AFastAPIApplication` / `A2AStarletteApplication`;
+  `add_a2a_routes_to_fastapi(app, ...)` mutates a `FastAPI` instance *you* own
+  and returns `None`. Owning the app is the point — it's what lets us add
+  `/healthz`, a lifespan that flushes telemetry, and
+  `FastAPIInstrumentor.instrument_app()`.
+* **No SDK builds an `AgentCard` from an agent.** `a2a.utils` exposes only
+  constants and proto helpers; `minimal_agent_card()` is a client-side stub with
+  empty skills. So the card is assembled field by field.
 
 ### Pin a trace id to find it in Tempo
 
