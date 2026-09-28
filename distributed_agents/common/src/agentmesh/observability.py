@@ -28,7 +28,10 @@ logger = logging.getLogger(__name__)
 def setup_observability(service_name: str) -> None:
     """Configure providers and process-wide HTTP instrumentation.
 
-    Call once at startup, before any agent or HTTP client is constructed.
+    Call once at startup. Doing it before the agent exists reads better but is
+    not required: the Agent Framework resolves its tracer lazily, per span, and
+    ``HTTPXClientInstrumentor`` patches httpx at class level, so agents and
+    clients constructed beforehand are still traced.
     """
     # Reads OTEL_EXPORTER_OTLP_* / ENABLE_SENSITIVE_DATA from the environment
     # and installs the tracer, meter and logger providers, plus the Agent
