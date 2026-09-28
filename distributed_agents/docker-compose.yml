@@ -1,0 +1,81 @@
+name: distributed-agents
+
+# Every agent is its own host: its own image, process and OTEL service name.
+# They share only the repo-root .env (model credentials + OTLP endpoint) and
+# the network they talk A2A over.
+x-agent: &agent
+  restart: unless-stopped
+  env_file:
+    - ../.env
+  networks:
+    - agents
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://localhost:8000/healthz")
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
+x-agent-env: &agent-env
+  AGENT_PORT: 8000
+  # W3C trace context is what stitches the per-host traces into one Tempo
+  # trace; state it explicitly rather than relying on the SDK default.
+  OTEL_PROPAGATORS: tracecontext,baggage
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local
+  # The A2A SDK traces its own internals, which buries the agent spans under
+  # ~100 queue/dispatcher spans per request. Flip to "true" when debugging the
+  # protocol layer itself rather than the agents.
+  OTEL_INSTRUMENTATION_A2A_SDK_ENABLED: "false"
+
+services:
+  billing-agent:
+    <<: *agent
+    build:
+      context: .
+      dockerfile: billing_agent/Dockerfile
+    environment:
+      <<: *agent-env
+      OTEL_SERVICE_NAME: billing-agent
+      AGENT_PUBLIC_URL: http://billing-agent:8000
+    ports:
+      - "8081:8000"
+
+  tech-agent:
+    <<: *agent
+    build:
+      context: .
+      dockerfile: tech_agent/Dockerfile
+    environment:
+      <<: *agent-env
+      OTEL_SERVICE_NAME: tech-agent
+      AGENT_PUBLIC_URL: http://tech-agent:8000
+    ports:
+      - "8082:8000"
+
+  triage-agent:
+    <<: *agent
+    build:
+      context: .
+      dockerfile: triage_agent/Dockerfile
+    environment:
+      <<: *agent-env
+      OTEL_SERVICE_NAME: triage-agent
+      AGENT_PUBLIC_URL: http://triage-agent:8000
+      # Triage resolves these agent cards at boot and turns each into a
+      # delegation tool, so specialists are configuration, not code.
+      A2A_PEER_URLS: http://billing-agent:8000,http://tech-agent:8000
+    ports:
+      - "8080:8000"
+    depends_on:
+      billing-agent:
+        condition: service_healthy
+      tech-agent:
+        condition: service_healthy
+
+networks:
+  agents:
+    driver: bridge

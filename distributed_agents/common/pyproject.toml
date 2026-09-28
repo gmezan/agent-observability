@@ -1,0 +1,33 @@
+[project]
+name = "agentmesh"
+version = "0.1.0"
+description = "Shared A2A serving + OpenTelemetry wiring for distributed Agent Framework agents"
+requires-python = ">=3.11"
+dependencies = [
+    # Agent Framework: core runtime, OpenAI/Azure OpenAI chat client, A2A bridge.
+    "agent-framework-core==1.19.0",
+    "agent-framework-openai==1.14.4",
+    "agent-framework-a2a==1.0.0b260918",
+    # A2A protocol server (Starlette/FastAPI routes + JSON-RPC dispatcher).
+    "a2a-sdk[fastapi]==1.1.5",
+    # httpx 2.x dropped the AsyncClient API that a2a-sdk and the OpenAI SDK
+    # still build against; without this ceiling a fresh resolve picks 2.x and
+    # every agent dies on import.
+    "httpx>=0.28.1,<1",
+    "fastapi==0.141.1",
+    "uvicorn==0.53.0",
+    "pydantic-settings==2.15.0",
+    # OTLP export plus the instrumentation that carries W3C traceparent
+    # across host boundaries (server extract + client inject).
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
+    "opentelemetry-instrumentation-fastapi==0.65b0",
+    "opentelemetry-instrumentation-httpx==0.65b0",
+    "opentelemetry-instrumentation-logging==0.65b0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentmesh"]
