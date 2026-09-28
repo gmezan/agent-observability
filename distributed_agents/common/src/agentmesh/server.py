@@ -1,7 +1,7 @@
 """Serve an Agent Framework agent over the standard A2A protocol."""
 
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin
 
@@ -66,7 +66,7 @@ def create_app(agent: BaseAgent, settings: ServiceSettings, skills: Sequence[Age
     )
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
         logger.info("agent serving over a2a", extra={"agent": agent.name, "url": settings.public_url})
         yield
         flush_telemetry()
