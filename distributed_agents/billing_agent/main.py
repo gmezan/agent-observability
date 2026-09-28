@@ -4,7 +4,7 @@ from typing import Annotated
 
 from agent_framework import Agent, tool
 from agent_framework.openai import OpenAIChatClient
-from agentmesh import ServiceSettings, serve, setup_observability, skills_from_tools
+from agentmesh import AgentSpec, ServiceSettings, run
 from pydantic import Field
 
 INSTRUCTIONS = (
@@ -31,21 +31,20 @@ async def issue_refund(
     return f"Refund of ${amount_usd:.2f} issued to account {account_id}."
 
 
-def main() -> None:
-    settings = ServiceSettings()
-    setup_observability(settings.service_name)
-
+def build(_: ServiceSettings) -> AgentSpec:
     tools = [check_invoice_status, issue_refund]
-    agent = Agent(
-        client=OpenAIChatClient(),
-        name="billing_agent",
-        description="Resolves billing issues: invoice status, payments and refunds.",
-        instructions=INSTRUCTIONS,
+    return AgentSpec(
+        agent=Agent(
+            client=OpenAIChatClient(),
+            name="billing_agent",
+            description="Resolves billing issues: invoice status, payments and refunds.",
+            instructions=INSTRUCTIONS,
+            tools=tools,
+        ),
         tools=tools,
+        tags=["billing"],
     )
-
-    serve(agent, settings, skills_from_tools(tools, tags=["billing"]))
 
 
 if __name__ == "__main__":
-    main()
+    run(build)

@@ -33,6 +33,7 @@ specialist is a URL in `docker-compose.yml`, not a code change.
 distributed_agents/
 ├── common/                  # "agentmesh": the shared plumbing, installed into every image
 │   └── src/agentmesh/
+│       ├── app.py           # run(build): config -> telemetry -> agent -> serve
 │       ├── settings.py      # env-driven deployment config (bind, public URL, peers)
 │       ├── observability.py # OTEL providers + the instrumentation that carries traceparent
 │       ├── server.py        # agent card, A2A routes, FastAPI app, uvicorn entrypoint
@@ -46,6 +47,28 @@ distributed_agents/
 Each service's `main.py` contains only domain code: the agent's name, its
 instructions and its tools. Everything about *being a service* — how it binds,
 how it's discovered, how it's traced — lives in `common/`.
+
+A service is therefore just a `build` function and one call:
+
+```python
+def build(_: ServiceSettings) -> AgentSpec:
+    tools = [check_invoice_status, issue_refund]
+    return AgentSpec(
+        agent=Agent(client=OpenAIChatClient(), name="billing_agent", ..., tools=tools),
+        tools=tools,
+        tags=["billing"],
+    )
+
+
+if __name__ == "__main__":
+    run(build)
+```
+
+`run()` takes a *builder* rather than a ready-made agent on purpose. Telemetry
+has to be configured before the agent exists — the Agent Framework resolves a
+tracer at construction time, so an agent built first keeps a no-op tracer and
+its `invoke_agent` spans never reach the exporter. Passing a callable makes that
+ordering structural instead of a comment someone can violate.
 
 ## Prerequisites
 
@@ -226,6 +249,35 @@ agent run on a background `asyncio` task. `asyncio.create_task` copies
 contextvars, so the extracted span context survives the hop off the request
 coroutine — the agent spans stay under the HTTP server span instead of becoming
 orphan roots.
+
+### Does A2A propagate traceparent by itself? No.
+
+It's commonly claimed that the A2A SDKs propagate `traceparent` across the hop
+automatically, so distributed tracing costs zero code. That is **not** true of
+`a2a-sdk` 1.1.5: `a2a/utils/telemetry.py` imports only `opentelemetry.trace`,
+and there is no `inject`, `extract` or propagator call anywhere in the package.
+The SDK *creates spans*; it never touches trace context.
+
+Propagation works here only because A2A rides on plain HTTP — httpx on the
+client side, ASGI on the server side — and those two libraries are instrumented.
+Measured on this stack, same request, same topology:
+
+| Configuration | Cross-host trace | `invoke_agent` spans | Outcome |
+| --- | --- | --- | --- |
+| **Explicit instrumentors** (this repo) | one trace, 12 spans | present | clean nesting |
+| A2A SDK's own tracing, no HTTP instrumentors | **two traces**, 66 + 65 spans | — | correlation silently lost |
+| `opentelemetry-instrument` (zero-code) | one trace, 8 spans | **missing** | orphaned parents, `http receive` noise |
+
+The middle row is the trap: with the SDK's own tracing enabled you get *more*
+spans than the working setup, so it looks thoroughly instrumented right up until
+you search Tempo and find the hop isn't there.
+
+Zero-code auto-instrumentation does restore correlation, but it installs its own
+tracer provider before the app starts, which costs the Agent Framework's
+`invoke_agent` spans — the ones that make this *agent* observability rather than
+HTTP observability. Hence three explicit instrumentor calls in
+`observability.py`, which is the "install the instrumentor for whatever makes
+the network call" advice, just written down where it can be seen.
 
 ### Pin a trace id to find it in Tempo
 

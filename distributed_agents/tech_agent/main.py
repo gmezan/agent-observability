@@ -4,7 +4,7 @@ from typing import Annotated
 
 from agent_framework import Agent, tool
 from agent_framework.openai import OpenAIChatClient
-from agentmesh import ServiceSettings, serve, setup_observability, skills_from_tools
+from agentmesh import AgentSpec, ServiceSettings, run
 from pydantic import Field
 
 INSTRUCTIONS = (
@@ -30,21 +30,20 @@ async def restart_device(
     return f"Restart command sent to device {device_id}. Expect ~60s downtime."
 
 
-def main() -> None:
-    settings = ServiceSettings()
-    setup_observability(settings.service_name)
-
+def build(_: ServiceSettings) -> AgentSpec:
     tools = [check_service_status, restart_device]
-    agent = Agent(
-        client=OpenAIChatClient(),
-        name="tech_support_agent",
-        description="Resolves technical issues: service outages and device restarts.",
-        instructions=INSTRUCTIONS,
+    return AgentSpec(
+        agent=Agent(
+            client=OpenAIChatClient(),
+            name="tech_support_agent",
+            description="Resolves technical issues: service outages and device restarts.",
+            instructions=INSTRUCTIONS,
+            tools=tools,
+        ),
         tools=tools,
+        tags=["technical-support"],
     )
-
-    serve(agent, settings, skills_from_tools(tools, tags=["technical-support"]))
 
 
 if __name__ == "__main__":
-    main()
+    run(build)

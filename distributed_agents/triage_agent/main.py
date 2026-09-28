@@ -8,13 +8,7 @@ themselves rather than by anything hardcoded here.
 
 from agent_framework import Agent
 from agent_framework.openai import OpenAIChatClient
-from agentmesh import (
-    ServiceSettings,
-    discover_peer_tools,
-    serve,
-    setup_observability,
-    skills_from_tools,
-)
+from agentmesh import AgentSpec, ServiceSettings, discover_peer_tools, run
 
 INSTRUCTIONS = (
     "You are the first point of contact for customer support at a bank. "
@@ -28,21 +22,20 @@ INSTRUCTIONS = (
 )
 
 
-def main() -> None:
-    settings = ServiceSettings()
-    setup_observability(settings.service_name)
-
+def build(settings: ServiceSettings) -> AgentSpec:
     tools = discover_peer_tools(settings.peer_urls, settings.peer_timeout_seconds)
-    agent = Agent(
-        client=OpenAIChatClient(),
-        name="triage_agent",
-        description="Front door for customer support; routes requests to the right specialist agent.",
-        instructions=INSTRUCTIONS,
+    return AgentSpec(
+        agent=Agent(
+            client=OpenAIChatClient(),
+            name="triage_agent",
+            description="Front door for customer support; routes requests to the right specialist agent.",
+            instructions=INSTRUCTIONS,
+            tools=tools,
+        ),
         tools=tools,
+        tags=["triage", "routing"],
     )
-
-    serve(agent, settings, skills_from_tools(tools, tags=["triage", "routing"]))
 
 
 if __name__ == "__main__":
-    main()
+    run(build)
