@@ -1,5 +1,11 @@
 # Architecture B — Custom Judge, No App Insights
 
+> **Implemented in [`custom_judge/`](../custom_judge/)** — the distributed agents
+> behind a standalone Collector, with a judge service that terminates OTLP,
+> scores the trace and emits a linked `gen_ai.evaluation` trace. Everything below
+> is real there except the scoring itself, which is a deterministic mock behind
+> the same interface a model-backed judge uses.
+
 Use this option when the judge is a self-hosted service (your own prompt, your own scoring
 rubric, any model you choose) rather than Azure AI Foundry's built-in evaluators. Since
 nothing here needs to *query* App Insights, App Insights is dropped entirely — the sampled

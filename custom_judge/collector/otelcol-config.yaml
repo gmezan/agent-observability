@@ -1,0 +1,194 @@
+# Custom OTel Collector -- Architecture B (docs/architecture-custom-judge.md).
+#
+# One receiver, two trace pipelines out of it:
+#
+#   agents --OTLP--> [otlp receiver] --+--> redact --> batch ------------------> Grafana Tempo   (100%)
+#                                      |
+#                                      +--> redact --> tail_sampling --> batch --> judge service (sampled)
+#
+# The split matters: Grafana gets everything so the operator can debug any
+# request, while the judge -- which costs a model call per trace -- only sees a
+# sampled subset, and only ever sees *complete* traces.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Refuse work before the process is OOM-killed. A killed collector loses
+  # every buffered trace, including the ones tail_sampling is still holding.
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # Moving redaction out of the agent process is half the reason this collector
+  # exists: the rule lives in one place instead of in every agent image, and it
+  # is applied before anything leaves the network.
+  #
+  # ENABLE_SENSITIVE_DATA=true means gen_ai.input.messages / gen_ai.output.messages
+  # carry raw customer text -- which is exactly what the judge needs to score,
+  # and exactly what must not reach a vendor backend unfiltered. blocked_values
+  # are regexes matched against attribute *values*, so they catch the pattern
+  # wherever it appears, including inside a serialised message blob.
+  redaction:
+    allow_all_keys: true
+    blocked_values:
+      - "\\b4[0-9]{12}(?:[0-9]{3})?\\b" # Visa-style PAN
+      - "\\b5[1-5][0-9]{14}\\b" # Mastercard-style PAN
+      - "\\b[0-9]{3}-[0-9]{2}-[0-9]{4}\\b" # US SSN
+      - "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b" # email
+    # "info" records how many values were masked without echoing the keys.
+    summary: info
+
+  batch:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 5s
+
+  # Belt and braces against an evaluation feedback loop. The judge exports its
+  # eval traces straight to Grafana, not here, so today nothing matches -- but
+  # the day someone repoints the judge at this collector to "keep it uniform",
+  # its eval spans would be sampled, sent back to the judge, and evaluated,
+  # forever. Cheap insurance for an expensive mistake.
+  filter/not-judge:
+    error_mode: ignore
+    traces:
+      span:
+        - 'resource.attributes["service.name"] == "${env:JUDGE_SERVICE_NAME}"'
+
+  # The reason a *Collector* does the sampling rather than the agent process:
+  # this decision needs the whole trace. tail_sampling buffers spans by
+  # trace_id and only decides once the trace has been quiet for decision_wait,
+  # so the judge is never handed a half-trace missing the answer it is meant to
+  # score. No head-based sampler can do that.
+  tail_sampling:
+    # Must exceed the slowest realistic request -- a multi-hop A2A call with
+    # several tool round-trips. Too short and long traces are cut in half.
+    decision_wait: 20s
+    num_traces: 50000
+    expected_new_traces_per_sec: 20
+    # Top-level policies are OR'd; sub-policies inside an `and` are AND'd.
+    # The rule being expressed is:
+    #
+    #   is-an-agent-conversation AND (errored OR slow OR in the baseline sample)
+    #
+    # tail_sampling has no `or` block, so the common term is repeated across
+    # three `and` policies rather than written once.
+    #
+    # The is-an-agent-conversation term is what keeps the judge from being
+    # billed for traces that contain no conversation: agent-card resolution at
+    # boot, health probes, bare HTTP calls. Only a trace where some span
+    # carries gen_ai.agent.name is a request an agent actually handled -- which
+    # is content-aware routing, and the reason this decision belongs in a
+    # collector that can see the whole trace.
+    policies:
+      # Anything that failed is always worth a verdict.
+      - name: agent-errors
+        type: and
+        and:
+          and_sub_policy:
+            - &is-agent-conversation
+              name: is-agent-conversation
+              type: string_attribute
+              string_attribute:
+                key: gen_ai.agent.name
+                values: [".+"]
+                enabled_regex_matching: true
+            - name: errored
+              type: status_code
+              status_code:
+                status_codes: [ERROR]
+
+      # So is anything pathologically slow -- usually a routing loop.
+      - name: agent-slow
+        type: and
+        and:
+          and_sub_policy:
+            - *is-agent-conversation
+            - name: slow
+              type: latency
+              latency:
+                threshold_ms: 20000
+
+      # Plus a flat sample of ordinary traffic, so the score distribution
+      # reflects normal behaviour and not just the failures.
+      - name: agent-baseline
+        type: and
+        and:
+          and_sub_policy:
+            - *is-agent-conversation
+            - name: baseline
+              type: probabilistic
+              probabilistic:
+                sampling_percentage: ${env:JUDGE_SAMPLING_PERCENTAGE}
+
+exporters:
+  # Leg 1: everything, to Grafana Cloud's OTLP gateway.
+  otlphttp/grafana:
+    endpoint: ${env:GRAFANA_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:GRAFANA_OTLP_AUTHORIZATION}
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_elapsed_time: 120s
+    sending_queue:
+      enabled: true
+      queue_size: 2000
+
+  # Leg 2: the sampled subset, to the judge's own OTLP receiver. No App
+  # Insights hop in between -- that is the whole point of Architecture B.
+  otlphttp/judge:
+    endpoint: ${env:JUDGE_OTLP_ENDPOINT}
+    compression: gzip
+    # The judge is a single container that may restart; drop rather than block
+    # the pipeline, since a missed evaluation is not a missed trace.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_elapsed_time: 60s
+    sending_queue:
+      enabled: true
+      queue_size: 500
+
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    # Everything the agents emit, unsampled, for the operator.
+    traces/grafana:
+      receivers: [otlp]
+      processors: [memory_limiter, redaction, batch]
+      exporters: [otlphttp/grafana]
+
+    # The same spans, redacted identically, then sampled for the judge.
+    traces/judge:
+      receivers: [otlp]
+      processors: [memory_limiter, redaction, filter/not-judge, tail_sampling, batch]
+      exporters: [otlphttp/judge]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/grafana]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, redaction, batch]
+      exporters: [otlphttp/grafana]
+
+  telemetry:
+    logs:
+      level: info
