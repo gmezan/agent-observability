@@ -47,6 +47,25 @@ Each service's `main.py` contains only domain code: the agent's name, its
 instructions and its tools. Everything about *being a service* — how it binds,
 how it's discovered, how it's traced — lives in `common/`.
 
+A service is therefore a `main()` that wires four things together:
+
+```python
+def main() -> None:
+    settings = ServiceSettings()
+    setup_observability(settings.service_name)
+
+    tools = [check_invoice_status, issue_refund]
+    agent = Agent(client=OpenAIChatClient(), name="billing_agent", ..., tools=tools)
+
+    serve(agent, settings, skills_from_tools(tools, tags=["billing"]))
+```
+
+Startup order is a readability convention, not a correctness requirement:
+`configure_otel_providers()` may be called after the agent exists. The Agent
+Framework resolves its tracer lazily, per span, and `HTTPXClientInstrumentor`
+patches httpx at class level, so objects built beforehand are still traced
+(both verified — see below).
+
 ## Prerequisites
 
 Docker, and the repo-root `.env` (Compose reads `../.env`). All three services
@@ -226,6 +245,62 @@ agent run on a background `asyncio` task. `asyncio.create_task` copies
 contextvars, so the extracted span context survives the hop off the request
 coroutine — the agent spans stay under the HTTP server span instead of becoming
 orphan roots.
+
+### Does A2A propagate traceparent by itself? No.
+
+It's commonly claimed that the A2A SDKs propagate `traceparent` across the hop
+automatically, so distributed tracing costs zero code. That is **not** true of
+`a2a-sdk` 1.1.5: `a2a/utils/telemetry.py` imports only `opentelemetry.trace`,
+and there is no `inject`, `extract` or propagator call anywhere in the package.
+The SDK *creates spans*; it never touches trace context.
+
+Propagation works here only because A2A rides on plain HTTP — httpx on the
+client side, ASGI on the server side — and those two libraries are instrumented.
+Measured on this stack, same request, same topology:
+
+| Configuration | Cross-host trace | `invoke_agent` spans | Outcome |
+| --- | --- | --- | --- |
+| **Explicit instrumentors** (this repo) | one trace, 12 spans | present | clean nesting |
+| A2A SDK's own tracing, no HTTP instrumentors | **two traces**, 66 + 65 spans | — | correlation silently lost |
+| `opentelemetry-instrument` (zero-code) | one trace, 8 spans | **missing** | orphaned parents, `http receive` noise |
+
+The middle row is the trap: with the SDK's own tracing enabled you get *more*
+spans than the working setup, so it looks thoroughly instrumented right up until
+you search Tempo and find the hop isn't there.
+
+Zero-code auto-instrumentation does restore correlation, but it installs its own
+tracer provider before the app starts, which costs the Agent Framework's
+`invoke_agent` spans — the ones that make this *agent* observability rather than
+HTTP observability. Hence three explicit instrumentor calls in
+`observability.py`, which is the "install the instrumentor for whatever makes
+the network call" advice, just written down where it can be seen.
+
+### What the SDKs do and don't give you
+
+`common/` is deliberately thin, but it isn't zero, and it's worth being precise
+about why each piece can't just be an SDK call. Checked against the installed
+versions (`agent-framework` 1.19.0, `a2a-sdk` 1.1.5):
+
+| Concern | SDK facility used | What's left hand-written |
+| --- | --- | --- |
+| Providers, exporters, gen_ai spans | `configure_otel_providers()` (Agent Framework) | nothing — one call, env-driven |
+| A2A routes + JSON-RPC dispatch | `add_a2a_routes_to_fastapi`, `create_agent_card_routes`, `create_jsonrpc_routes` | nothing — this *is* the documented pattern |
+| Serving an agent over A2A | `A2AExecutor` (Agent Framework), `DefaultRequestHandler` (a2a-sdk) | nothing |
+| Peer discovery | `A2ACardResolver` + `A2AAgent.as_tool()` | a loop over `A2A_PEER_URLS` |
+| **traceparent across the hop** | `HTTPXClientInstrumentor`, `FastAPIInstrumentor` | 3 calls — no A2A/MAF equivalent exists |
+| **Building the AgentCard / skills** | — | `build_agent_card()`, `skills_from_tools()` |
+
+Two things are worth knowing before trying to delete more:
+
+* **`a2a-sdk` 1.1.5 has no application class.** There is no `a2a.server.apps`
+  package and no `A2AFastAPIApplication` / `A2AStarletteApplication`;
+  `add_a2a_routes_to_fastapi(app, ...)` mutates a `FastAPI` instance *you* own
+  and returns `None`. Owning the app is the point — it's what lets us add
+  `/healthz`, a lifespan that flushes telemetry, and
+  `FastAPIInstrumentor.instrument_app()`.
+* **No SDK builds an `AgentCard` from an agent.** `a2a.utils` exposes only
+  constants and proto helpers; `minimal_agent_card()` is a client-side stub with
+  empty skills. So the card is assembled field by field.
 
 ### Pin a trace id to find it in Tempo
 
