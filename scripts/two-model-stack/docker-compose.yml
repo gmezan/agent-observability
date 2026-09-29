@@ -1,0 +1,140 @@
+name: agents-two-models
+
+# Runs the triage/billing/tech mesh twice from the *already built* images --
+# once on gpt-4.1, once on gpt-4.1-mini. The two instances are identical apart
+# from AZURE_OPENAI_CHAT_MODEL, so any difference in the traces (latency, token
+# usage, routing decisions, tool calls) is the model.
+#
+# This file never builds. The images come from `distributed_agents/`:
+#
+#   cd distributed_agents && docker compose build
+#
+# which tags them `distributed-agents-<role>-agent:latest`. Override the tags
+# below if yours are named differently.
+x-agent: &agent
+  restart: unless-stopped
+  # These images are local build artifacts, not registry images. Without this,
+  # Compose tries to pull them and fails with a misleading "pull access denied
+  # / repository does not exist" instead of telling you they aren't built.
+  pull_policy: missing
+  # Credentials + OTLP destination, shared by all six services.
+  env_file:
+    - ../../.env
+  networks:
+    - agents
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://localhost:8000/healthz")
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
+x-agent-env: &agent-env
+  AGENT_PORT: 8000
+  # W3C trace context is what stitches the per-host traces into one Tempo
+  # trace; state it explicitly rather than relying on the SDK default.
+  OTEL_PROPAGATORS: tracecontext,baggage
+  # The A2A SDK traces its own internals, which buries the agent spans under
+  # ~100 queue/dispatcher spans per request. Flip to "true" when debugging the
+  # protocol layer itself rather than the agents.
+  OTEL_INSTRUMENTATION_A2A_SDK_ENABLED: "false"
+
+# Per-instance overrides. `environment` wins over `env_file`, so each instance
+# pins its own model regardless of what the shared .env says.
+#
+# `service.instance.id` is the OTEL-native way to tell two deployments of the
+# same service apart; `llm.model` is carried as a resource attribute so a
+# dashboard can group by model without digging into the chat spans.
+x-gpt41-env: &gpt41-env
+  AZURE_OPENAI_CHAT_MODEL: gpt-4.1
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local,service.instance.id=gpt-4.1,llm.model=gpt-4.1
+
+x-gpt41-mini-env: &gpt41-mini-env
+  AZURE_OPENAI_CHAT_MODEL: gpt-4.1-mini
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local,service.instance.id=gpt-4.1-mini,llm.model=gpt-4.1-mini
+
+services:
+  # ---------------------------------------------------------------- gpt-4.1 --
+  billing-agent-gpt41:
+    <<: *agent
+    image: ${BILLING_AGENT_IMAGE:-distributed-agents-billing-agent:latest}
+    environment:
+      <<: [*agent-env, *gpt41-env]
+      OTEL_SERVICE_NAME: billing-agent-gpt41
+      AGENT_PUBLIC_URL: http://billing-agent-gpt41:8000
+    ports:
+      - "8091:8000"
+
+  tech-agent-gpt41:
+    <<: *agent
+    image: ${TECH_AGENT_IMAGE:-distributed-agents-tech-agent:latest}
+    environment:
+      <<: [*agent-env, *gpt41-env]
+      OTEL_SERVICE_NAME: tech-agent-gpt41
+      AGENT_PUBLIC_URL: http://tech-agent-gpt41:8000
+    ports:
+      - "8092:8000"
+
+  triage-agent-gpt41:
+    <<: *agent
+    image: ${TRIAGE_AGENT_IMAGE:-distributed-agents-triage-agent:latest}
+    environment:
+      <<: [*agent-env, *gpt41-env]
+      OTEL_SERVICE_NAME: triage-agent-gpt41
+      AGENT_PUBLIC_URL: http://triage-agent-gpt41:8000
+      # Triage resolves these agent cards at boot and turns each into a
+      # delegation tool. Each instance only lists its own specialists, so a
+      # trace never straddles the two models.
+      A2A_PEER_URLS: http://billing-agent-gpt41:8000,http://tech-agent-gpt41:8000
+    ports:
+      - "8090:8000"
+    depends_on:
+      billing-agent-gpt41:
+        condition: service_healthy
+      tech-agent-gpt41:
+        condition: service_healthy
+
+  # ----------------------------------------------------------- gpt-4.1-mini --
+  billing-agent-gpt41-mini:
+    <<: *agent
+    image: ${BILLING_AGENT_IMAGE:-distributed-agents-billing-agent:latest}
+    environment:
+      <<: [*agent-env, *gpt41-mini-env]
+      OTEL_SERVICE_NAME: billing-agent-gpt41-mini
+      AGENT_PUBLIC_URL: http://billing-agent-gpt41-mini:8000
+    ports:
+      - "8081:8000"
+
+  tech-agent-gpt41-mini:
+    <<: *agent
+    image: ${TECH_AGENT_IMAGE:-distributed-agents-tech-agent:latest}
+    environment:
+      <<: [*agent-env, *gpt41-mini-env]
+      OTEL_SERVICE_NAME: tech-agent-gpt41-mini
+      AGENT_PUBLIC_URL: http://tech-agent-gpt41-mini:8000
+    ports:
+      - "8082:8000"
+
+  triage-agent-gpt41-mini:
+    <<: *agent
+    image: ${TRIAGE_AGENT_IMAGE:-distributed-agents-triage-agent:latest}
+    environment:
+      <<: [*agent-env, *gpt41-mini-env]
+      OTEL_SERVICE_NAME: triage-agent-gpt41-mini
+      AGENT_PUBLIC_URL: http://triage-agent-gpt41-mini:8000
+      A2A_PEER_URLS: http://billing-agent-gpt41-mini:8000,http://tech-agent-gpt41-mini:8000
+    ports:
+      - "8080:8000"
+    depends_on:
+      billing-agent-gpt41-mini:
+        condition: service_healthy
+      tech-agent-gpt41-mini:
+        condition: service_healthy
+
+networks:
+  agents:
+    driver: bridge

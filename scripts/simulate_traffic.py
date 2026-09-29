@@ -36,9 +36,9 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 
-# The two deployments from distributed_agents/docker-compose.yml. Only the
-# triage agents are addressed: hitting a specialist directly would skip the
-# routing decision, which is the interesting part of the trace.
+# The two deployments from two-model-stack/docker-compose.yml. Only the triage
+# agents are addressed: hitting a specialist directly would skip the routing
+# decision, which is the interesting part of the trace.
 TARGETS: dict[str, str] = {
     "gpt-4.1": "http://localhost:8090",
     "gpt-4.1-mini": "http://localhost:8080",

@@ -3,11 +3,6 @@ name: distributed-agents
 # Every agent is its own host: its own image, process and OTEL service name.
 # They share only the repo-root .env (model credentials + OTLP endpoint) and
 # the network they talk A2A over.
-#
-# The whole triage/billing/tech mesh is deployed *twice*, once per model:
-# suffix `-gpt41` runs gpt-4.1, suffix `-gpt41-mini` runs gpt-4.1-mini. The two
-# instances are identical in every other respect, so any difference in the
-# traces -- latency, token usage, routing decisions, tool calls -- is the model.
 x-agent: &agent
   restart: unless-stopped
   env_file:
@@ -30,121 +25,55 @@ x-agent-env: &agent-env
   # W3C trace context is what stitches the per-host traces into one Tempo
   # trace; state it explicitly rather than relying on the SDK default.
   OTEL_PROPAGATORS: tracecontext,baggage
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local
   # The A2A SDK traces its own internals, which buries the agent spans under
   # ~100 queue/dispatcher spans per request. Flip to "true" when debugging the
   # protocol layer itself rather than the agents.
   OTEL_INSTRUMENTATION_A2A_SDK_ENABLED: "false"
 
-# Per-instance overrides. AZURE_OPENAI_CHAT_MODEL comes from ../.env for local
-# runs; `environment` wins over `env_file`, so each instance pins its own model
-# regardless of what the shared .env says.
-#
-# `service.instance.id` is the OTEL-native way to tell two deployments of the
-# same service apart, and `llm.model` is carried as a resource attribute so a
-# dashboard can group by model without digging into the chat spans.
-x-gpt41-env: &gpt41-env
-  AZURE_OPENAI_CHAT_MODEL: gpt-4.1
-  OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local,service.instance.id=gpt-4.1,llm.model=gpt-4.1
-
-x-gpt41-mini-env: &gpt41-mini-env
-  AZURE_OPENAI_CHAT_MODEL: gpt-4.1-mini
-  OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local,service.instance.id=gpt-4.1-mini,llm.model=gpt-4.1-mini
-
 services:
-  # ---------------------------------------------------------------- gpt-4.1 --
-  billing-agent-gpt41:
+  billing-agent:
     <<: *agent
-    image: distributed-agents/billing-agent:latest
     build:
       context: .
       dockerfile: billing_agent/Dockerfile
     environment:
-      <<: [*agent-env, *gpt41-env]
-      OTEL_SERVICE_NAME: billing-agent-gpt41
-      AGENT_PUBLIC_URL: http://billing-agent-gpt41:8000
-    ports:
-      - "8091:8000"
-
-  tech-agent-gpt41:
-    <<: *agent
-    image: distributed-agents/tech-agent:latest
-    build:
-      context: .
-      dockerfile: tech_agent/Dockerfile
-    environment:
-      <<: [*agent-env, *gpt41-env]
-      OTEL_SERVICE_NAME: tech-agent-gpt41
-      AGENT_PUBLIC_URL: http://tech-agent-gpt41:8000
-    ports:
-      - "8092:8000"
-
-  triage-agent-gpt41:
-    <<: *agent
-    image: distributed-agents/triage-agent:latest
-    build:
-      context: .
-      dockerfile: triage_agent/Dockerfile
-    environment:
-      <<: [*agent-env, *gpt41-env]
-      OTEL_SERVICE_NAME: triage-agent-gpt41
-      AGENT_PUBLIC_URL: http://triage-agent-gpt41:8000
-      # Triage resolves these agent cards at boot and turns each into a
-      # delegation tool, so specialists are configuration, not code. Each
-      # instance only ever talks to its own specialists, so a trace never
-      # straddles the two models.
-      A2A_PEER_URLS: http://billing-agent-gpt41:8000,http://tech-agent-gpt41:8000
-    ports:
-      - "8090:8000"
-    depends_on:
-      billing-agent-gpt41:
-        condition: service_healthy
-      tech-agent-gpt41:
-        condition: service_healthy
-
-  # ----------------------------------------------------------- gpt-4.1-mini --
-  billing-agent-gpt41-mini:
-    <<: *agent
-    image: distributed-agents/billing-agent:latest
-    build:
-      context: .
-      dockerfile: billing_agent/Dockerfile
-    environment:
-      <<: [*agent-env, *gpt41-mini-env]
-      OTEL_SERVICE_NAME: billing-agent-gpt41-mini
-      AGENT_PUBLIC_URL: http://billing-agent-gpt41-mini:8000
+      <<: *agent-env
+      OTEL_SERVICE_NAME: billing-agent
+      AGENT_PUBLIC_URL: http://billing-agent:8000
     ports:
       - "8081:8000"
 
-  tech-agent-gpt41-mini:
+  tech-agent:
     <<: *agent
-    image: distributed-agents/tech-agent:latest
     build:
       context: .
       dockerfile: tech_agent/Dockerfile
     environment:
-      <<: [*agent-env, *gpt41-mini-env]
-      OTEL_SERVICE_NAME: tech-agent-gpt41-mini
-      AGENT_PUBLIC_URL: http://tech-agent-gpt41-mini:8000
+      <<: *agent-env
+      OTEL_SERVICE_NAME: tech-agent
+      AGENT_PUBLIC_URL: http://tech-agent:8000
     ports:
       - "8082:8000"
 
-  triage-agent-gpt41-mini:
+  triage-agent:
     <<: *agent
-    image: distributed-agents/triage-agent:latest
     build:
       context: .
       dockerfile: triage_agent/Dockerfile
     environment:
-      <<: [*agent-env, *gpt41-mini-env]
-      OTEL_SERVICE_NAME: triage-agent-gpt41-mini
-      AGENT_PUBLIC_URL: http://triage-agent-gpt41-mini:8000
-      A2A_PEER_URLS: http://billing-agent-gpt41-mini:8000,http://tech-agent-gpt41-mini:8000
+      <<: *agent-env
+      OTEL_SERVICE_NAME: triage-agent
+      AGENT_PUBLIC_URL: http://triage-agent:8000
+      # Triage resolves these agent cards at boot and turns each into a
+      # delegation tool, so specialists are configuration, not code.
+      A2A_PEER_URLS: http://billing-agent:8000,http://tech-agent:8000
     ports:
       - "8080:8000"
     depends_on:
-      billing-agent-gpt41-mini:
+      billing-agent:
         condition: service_healthy
-      tech-agent-gpt41-mini:
+      tech-agent:
         condition: service_healthy
 
 networks:
