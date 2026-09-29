@@ -42,6 +42,9 @@ from datetime import datetime
 TARGETS: dict[str, str] = {
     "gpt-4.1": "http://localhost:8090",
     "gpt-4.1-mini": "http://localhost:8080",
+    # custom_judge/: one gpt-4.1-mini stack behind a collector + LLM judge. On
+    # its own port range so it can run alongside the two above.
+    "custom-judge": "http://localhost:8180",
 }
 
 # Fixed prompts, one picked at random per interaction. Deliberately a mix of

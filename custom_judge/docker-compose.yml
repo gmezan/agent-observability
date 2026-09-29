@@ -1,0 +1,179 @@
+name: custom-judge
+
+# Architecture B, end to end (docs/architecture-custom-judge.md):
+#
+#   triage/billing/tech --OTLP--> collector --+--> Grafana Tempo        (100%)
+#                                             +--> judge  --> Grafana   (sampled)
+#
+# One agent stack, one model (gpt-4.1-mini). The agents are the *already built*
+# images from distributed_agents/ -- this file never builds them, exactly like
+# scripts/two-model-stack. Only the judge is built here, because only the judge
+# is new.
+#
+#   cd distributed_agents && docker compose build     # once, after a code change
+#   cd custom_judge && docker compose up -d --build --wait
+#
+# The one difference that makes this Architecture B rather than the plain
+# distributed stack: the agents' OTEL_EXPORTER_OTLP_ENDPOINT points at the
+# collector, not at Grafana. Nothing inside the agent images changes.
+
+x-agent: &agent
+  restart: unless-stopped
+  # Local build artifacts, not registry images. Without this Compose tries to
+  # pull and fails with a misleading "pull access denied" instead of saying
+  # the image was never built.
+  pull_policy: missing
+  env_file:
+    - ../.env
+  networks:
+    - judged
+  depends_on:
+    collector:
+      condition: service_started
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://localhost:8000/healthz")
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
+x-agent-env: &agent-env
+  AGENT_PORT: 8000
+  OTEL_PROPAGATORS: tracecontext,baggage
+  OTEL_INSTRUMENTATION_A2A_SDK_ENABLED: "false"
+
+  # >>> The Architecture B switch <<<
+  # Spans now go to the local collector instead of straight to Grafana. The
+  # Basic auth header from .env must be blanked or the agents would present
+  # Grafana Cloud credentials to a plaintext local collector.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_EXPORTER_OTLP_HEADERS: ""
+
+  # The judge scores the conversation, so it needs the conversation. Without
+  # this, gen_ai.input.messages / gen_ai.output.messages are never recorded and
+  # the judge has nothing to read -- it logs "no scoreable content" and skips.
+  # Redaction of that text happens in the collector, not here.
+  ENABLE_SENSITIVE_DATA: "true"
+
+  AZURE_OPENAI_CHAT_MODEL: gpt-4.1-mini
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local,service.instance.id=gpt-4.1-mini,llm.model=gpt-4.1-mini
+
+services:
+  # --------------------------------------------------------------- collector --
+  # Fans one OTLP stream into two: everything to Grafana, a sampled subset to
+  # the judge. See collector/otelcol-config.yaml for the pipelines.
+  collector:
+    image: otel/opentelemetry-collector-contrib:${OTELCOL_VERSION:-0.137.0}
+    restart: unless-stopped
+    # Supplies GRAFANA_OTLP_ENDPOINT and GRAFANA_OTLP_AUTHORIZATION, which the
+    # collector config reads as ${env:...}.
+    env_file:
+      - ../.env
+    environment:
+      JUDGE_OTLP_ENDPOINT: http://judge:4318
+      # Named here so the collector's loop-guard filter and the judge's
+      # OTEL_SERVICE_NAME can never drift apart.
+      JUDGE_SERVICE_NAME: judge-service
+      # Demo default: judge every sampled-eligible trace, so a handful of
+      # requests actually produces verdicts. In production this is the cost
+      # dial -- 5-25 is typical, since a judge costs a model call per trace.
+      # tail_sampling's value is trace *completeness*, which holds at any rate.
+      JUDGE_SAMPLING_PERCENTAGE: ${JUDGE_SAMPLING_PERCENTAGE:-100}
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./collector/otelcol-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP/gRPC
+      - "4318:4318" # OTLP/HTTP
+      - "13133:13133" # health_check extension
+    networks:
+      - judged
+
+  # ------------------------------------------------------------------- judge --
+  # Terminates OTLP itself, reassembles each sampled trace, scores it, and
+  # emits the verdict as a new trace linked back to the original.
+  judge:
+    build:
+      context: ./judge_service
+    restart: unless-stopped
+    # Note what is NOT overridden: OTEL_EXPORTER_OTLP_ENDPOINT stays at the
+    # Grafana value from .env. The judge exports straight to Grafana, never
+    # back through the collector -- routing it through would feed its own eval
+    # traces into tail_sampling and back into itself.
+    env_file:
+      - ../.env
+    environment:
+      OTEL_SERVICE_NAME: judge-service
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=banking-support,deployment.environment=local
+      # "mock" scores without a model call. Set to "llm" to run the real rubric
+      # through AZURE_OPENAI_CHAT_MODEL.
+      JUDGE_MODE: ${JUDGE_MODE:-mock}
+      JUDGE_PORT: 4318
+      # Must comfortably exceed the collector's batch timeout (5s) so a trace
+      # split across batches is reassembled before it is scored.
+      JUDGE_TRACE_IDLE_SECONDS: 8
+    ports:
+      - "8185:4318"
+    networks:
+      - judged
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://localhost:4318/healthz")
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  # ------------------------------------------------------------------ agents --
+  billing-agent:
+    <<: *agent
+    image: ${BILLING_AGENT_IMAGE:-distributed-agents-billing-agent:latest}
+    environment:
+      <<: *agent-env
+      OTEL_SERVICE_NAME: billing-agent
+      AGENT_PUBLIC_URL: http://billing-agent:8000
+    ports:
+      - "8181:8000"
+
+  tech-agent:
+    <<: *agent
+    image: ${TECH_AGENT_IMAGE:-distributed-agents-tech-agent:latest}
+    environment:
+      <<: *agent-env
+      OTEL_SERVICE_NAME: tech-agent
+      AGENT_PUBLIC_URL: http://tech-agent:8000
+    ports:
+      - "8182:8000"
+
+  triage-agent:
+    <<: *agent
+    image: ${TRIAGE_AGENT_IMAGE:-distributed-agents-triage-agent:latest}
+    environment:
+      <<: *agent-env
+      OTEL_SERVICE_NAME: triage-agent
+      AGENT_PUBLIC_URL: http://triage-agent:8000
+      A2A_PEER_URLS: http://billing-agent:8000,http://tech-agent:8000
+    # 818x, clear of distributed_agents/ (808x) and two-model-stack (808x/809x),
+    # so this stack coexists with them instead of fighting for ports.
+    # scripts/simulate_traffic.py knows this one as the "custom-judge" target.
+    ports:
+      - "8180:8000"
+    depends_on:
+      collector:
+        condition: service_started
+      billing-agent:
+        condition: service_healthy
+      tech-agent:
+        condition: service_healthy
+
+networks:
+  judged:
+    driver: bridge
